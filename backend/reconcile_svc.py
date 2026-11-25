@@ -6,9 +6,12 @@ import json
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
+from metrics_math import METRIC_LABELS
 from validators import validate_permit_match
 
 router = APIRouter(tags=["reconcile"])
+
+_LABEL_TO_KEY = {v: k for k, v in METRIC_LABELS.items()}
 
 
 @router.get("/api/reconcile")
@@ -41,7 +44,8 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
         "SELECT * FROM discharge_permits WHERE permit_code=?", (permit_code,)
     ).fetchone()
     samples = conn.execute(
-        """SELECT sample_code, flow_m3h, metrics, status, generation FROM sample_batches
+        """SELECT id, sample_code, outfall_id, flow_m3h, metrics, status, generation
+           FROM sample_batches
            WHERE permit_ref=? AND status NOT IN ('作废')""",
         (permit_code,),
     ).fetchall()
@@ -50,6 +54,7 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
             "permit_code": permit_code,
             "balanced": False,
             "reason": "无采样批次",
+            "threshold_aligned": True,
             "samples": [],
         }
     caps = {
@@ -59,6 +64,7 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
     }
     details = []
     all_ok = True
+    all_aligned = True
     for s in samples:
         metrics = json.loads(s["metrics"] or "{}")
         ok = validate_permit_match(
@@ -66,6 +72,32 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
         )
         if not ok:
             all_ok = False
+        outfall = conn.execute(
+            "SELECT cod_limit, nh3n_limit, tp_limit FROM outfalls WHERE id=?",
+            (s["outfall_id"],),
+        ).fetchone()
+        limits = (
+            {
+                "cod": float(outfall["cod_limit"]),
+                "nh3n": float(outfall["nh3n_limit"]),
+                "tp": float(outfall["tp_limit"]),
+            }
+            if outfall
+            else None
+        )
+        open_hold = conn.execute(
+            """SELECT exceed_metric, limit_value FROM exceed_holds
+               WHERE sample_id=? AND status='开放' ORDER BY id DESC""",
+            (s["id"],),
+        ).fetchone()
+        hold_metric = open_hold["exceed_metric"] if open_hold else None
+        hold_limit = float(open_hold["limit_value"]) if open_hold else None
+        aligned = True
+        if open_hold and limits is not None:
+            key = _LABEL_TO_KEY.get(hold_metric)
+            aligned = key is not None and hold_limit == limits[key]
+        if not aligned:
+            all_aligned = False
         details.append(
             {
                 "sample_code": s["sample_code"],
@@ -74,6 +106,10 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
                 "metrics": metrics,
                 "flow_m3h": s["flow_m3h"],
                 "matched": ok,
+                "outfall_limits": limits,
+                "open_hold_metric": hold_metric,
+                "open_hold_limit": hold_limit,
+                "threshold_aligned": aligned,
             }
         )
     seal_rows = conn.execute(
@@ -87,6 +123,7 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
         "quota_m3d": permit["quota_m3d"],
         "caps": caps,
         "balanced": all_ok,
+        "threshold_aligned": all_aligned,
         "proof_ready": all_ok and len(seal_rows) >= 1,
         "seal_count": len(seal_rows),
         "samples": details,

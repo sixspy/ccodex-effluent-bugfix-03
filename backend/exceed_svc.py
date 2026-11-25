@@ -1,6 +1,8 @@
 """超标旁路挂起开闭。"""
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
@@ -15,7 +17,9 @@ router = APIRouter(tags=["exceed"])
 def list_exceeds(authorization: AuthHeader = None, status: str | None = None):
     require_user(authorization)
     with connect() as conn:
-        q = """SELECT h.*, s.sample_code, o.outfall_code FROM exceed_holds h
+        q = """SELECT h.*, s.sample_code, o.outfall_code,
+                      o.cod_limit AS outfall_cod_limit
+               FROM exceed_holds h
                JOIN sample_batches s ON s.id=h.sample_id
                JOIN outfalls o ON o.id=s.outfall_id"""
         if status:
@@ -142,13 +146,105 @@ def close_exceed(body: ExceedCloseIn, authorization: AuthHeader = None):
 
 @router.post("/api/exceeds/tighten")
 def tighten_threshold(body: dict, authorization: AuthHeader = None):
-    """BUGFIX-03 埋雷：只改阈值表，不重开未结挂起。"""
+    """阈值加严（甲路径）：同事务重开未结挂起并改写挂起阈，否则整笔回退。
+
+    口径：新阈须严于旧阈，偏离记「加严偏航」拒写；同口并发抢超标锁
+    （exceed_tighten:outfall:{id}），败方只记争用痕、零改。
+    """
     user = require_writer(authorization)
     outfall_id = int(body.get("outfall_id") or 0)
     cod = float(body.get("cod_limit") or 0)
+    lock_key = f"exceed_tighten:outfall:{outfall_id}"
     with connect() as conn:
-        conn.execute("UPDATE outfalls SET cod_limit=? WHERE id=?", (cod, outfall_id))
-        # 故意不 UPDATE exceed_holds 开放行
-        write_audit(conn, user, "tighten", str(outfall_id), {"cod_limit": cod, "reopen": False})
-        conn.commit()
-        return {"ok": True, "reopened_holds": 0}
+        if not conn.execute(
+            "SELECT id FROM outfalls WHERE id=?", (outfall_id,)
+        ).fetchone():
+            raise HTTPException(404, "排放口不存在")
+        if cod <= 0:
+            raise HTTPException(400, "加严阈值非法")
+        try:
+            require_lock(conn, lock_key, user)
+        except HTTPException:
+            conn.commit()  # 败方只记争用痕：落痕后放行 409，业务零改
+            raise
+        except sqlite3.IntegrityError:
+            # 锁行在 SELECT 与 INSERT 之间被并发方插入：视同争用败方
+            conn.rollback()
+            row = conn.execute(
+                "SELECT holder FROM effluent_locks WHERE lock_key=?", (lock_key,)
+            ).fetchone()
+            conn.execute(
+                """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
+                   VALUES (?,?,?,?,?)""",
+                (
+                    lock_key,
+                    user,
+                    "争用失败",
+                    f"持有人={row['holder'] if row else '?'}",
+                    now_iso(),
+                ),
+            )
+            conn.commit()
+            raise HTTPException(409, f"锁被占用：{lock_key}")
+        try:
+            # 锁内重读现阈：并发请求被序列化后须按最新阈判定偏航
+            outfall = conn.execute(
+                "SELECT * FROM outfalls WHERE id=?", (outfall_id,)
+            ).fetchone()
+            old = float(outfall["cod_limit"])
+            if cod >= old:
+                write_audit(
+                    conn,
+                    user,
+                    "tighten_deviation",
+                    outfall["outfall_code"],
+                    {
+                        "old_limit": old,
+                        "new_limit": cod,
+                        "reason": "加严偏航：新阈未严于旧阈",
+                    },
+                )
+                conn.commit()
+                raise HTTPException(400, "加严偏航：新阈须严于旧阈，拒写")
+            conn.execute(
+                "UPDATE outfalls SET cod_limit=? WHERE id=?", (cod, outfall_id)
+            )
+            open_holds = conn.execute(
+                """SELECT h.id FROM exceed_holds h
+                   JOIN sample_batches s ON s.id=h.sample_id
+                   WHERE s.outfall_id=? AND h.status='开放' AND h.exceed_metric='COD'""",
+                (outfall_id,),
+            ).fetchall()
+            for hold in open_holds:
+                conn.execute(
+                    """UPDATE exceed_holds
+                       SET limit_value=?, opened_at=?,
+                           note=trim(COALESCE(note,'') || ' 加严重开')
+                       WHERE id=?""",
+                    (cod, now_iso(), hold["id"]),
+                )
+            write_audit(
+                conn,
+                user,
+                "tighten",
+                outfall["outfall_code"],
+                {
+                    "cod_limit": cod,
+                    "old_limit": old,
+                    "reopened_holds": len(open_holds),
+                },
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()  # 整笔回退：阈值与挂起重开同生共死
+            raise
+        finally:
+            release(conn, lock_key, user)
+            conn.commit()
+        return {
+            "ok": True,
+            "outfall_id": outfall_id,
+            "cod_limit": cod,
+            "old_limit": old,
+            "reopened_holds": len(open_holds),
+        }

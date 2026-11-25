@@ -34,6 +34,7 @@ export function createApi(getToken, onUnauthorized) {
     exceeds: (status) => request("/api/exceeds" + (status ? ("?status=" + encodeURIComponent(status)) : "")),
     closeExceed: (body) => request("/api/exceeds/close", { method: "POST", body: JSON.stringify(body) }),
     openExceed: (body) => request("/api/exceeds/open", { method: "POST", body: JSON.stringify(body) }),
+    tighten: (body) => request("/api/exceeds/tighten", { method: "POST", body: JSON.stringify(body) }),
     releases: () => request("/api/releases"),
     createRelease: (body) => request("/api/releases", { method: "POST", body: JSON.stringify(body) }),
     seals: () => request("/api/seals"),

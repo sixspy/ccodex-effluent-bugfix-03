@@ -56,6 +56,7 @@ createApp({
       cod: 35, nh3n: 2.5, tp: 0.2, flow_m3h: 1800,
     });
     const releaseForm = ref({ sample_id: 0, officer: "值班员" });
+    const tightenForm = ref({ outfall_id: 1, cod_limit: 40 });
     const sealForm = ref({ sample_id: 0, snapshot: "" });
     const permitForm = ref({
       permit_code: "DP-NEW-01", plant_id: 1, quota_m3d: 18000,
@@ -164,6 +165,7 @@ createApp({
       }));
     }
     async function closeExceed(id) { await flash(() => api.closeExceed({ hold_id: id, note: "页面闭环" })); }
+    async function doTighten() { await flash(() => api.tighten(tightenForm.value)); }
     async function createRelease() { await flash(() => api.createRelease(releaseForm.value)); }
     async function createSeal() {
       await flash(() => api.createSeal({
@@ -222,10 +224,10 @@ createApp({
       lineageEdges, labJobs, sludgeJobs, plantDetail, sampleDetail,
       reconOne, reconAllItems, proofOne, reconCode, proofCode,
       plantForm, outfallForm, sampleForm, releaseForm, sealForm, permitForm,
-      lineageForm, labForm, sludgeForm, releasableSamples, sealableSamples,
+      tightenForm, lineageForm, labForm, sludgeForm, releasableSamples, sealableSamples,
       login, logout, refresh, statusClass, sampleClass, fmtMetrics,
       loadPlant, loadSample, createPlant, createOutfall, createSample,
-      closeExceed, createRelease, createSeal, createPermit, createLineage,
+      closeExceed, doTighten, createRelease, createSeal, createPermit, createLineage,
       loadReconcile, loadReconcileOne, loadProof, enqueueLab, enqueueSludge,
     };
   },
